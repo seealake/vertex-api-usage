@@ -1,0 +1,3 @@
+# requirements.txt
+# Minimal deps for this repo (Vertex AI Express Mode via google-genai)
+google-genai>=1.56.0,<2
