@@ -14,63 +14,9 @@ RETRYABLE_STATUS = {429, 500, 503, 504}
 # 填充后的模板区
 # =========================
 SYSTEM_INSTRUCTION = """
-你是一个“信息抽取与结构化输出”引擎。
-你必须只输出严格符合给定 JSON Schema 的 JSON（不允许 Markdown，不允许解释文字，不允许额外字段）。
-规则：
-1) 输出必须是合法 JSON，可被 json.loads 解析。
-2) 所有 required 字段都必须出现；缺失信息用 null 或空数组/空字符串（按 schema 类型）。
-3) 不要臆造事实；只能基于输入文本。
-4) 保持内容简洁：summary <= 120 字；key_points 最多 8 条。
 """
 
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {
-            "type": "string",
-            "description": "对输入文本的简短摘要（<=120字）",
-        },
-        "key_points": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "关键要点列表（最多8条）",
-        },
-        "entities": {
-            "type": "array",
-            "description": "从文本中抽取到的实体",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["PERSON", "ORG", "DATE", "LOCATION", "MONEY", "PRODUCT", "OTHER"],
-                    },
-                    "text": {"type": "string", "description": "原文片段"},
-                    "normalized": {"type": ["string", "null"], "description": "标准化形式"},
-                    "evidence": {"type": ["string", "null"], "description": "支持该实体的原文短证据（可选）"},
-                },
-                "required": ["kind", "text", "normalized", "evidence"],
-            },
-        },
-        "labels": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "你给文本打的标签（比如: contract, complaint, resume, policy 等）",
-        },
-        "confidence": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 1,
-            "description": "对整体抽取结果的自信度（0~1）",
-        },
-        "warnings": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "不确定、歧义、缺失信息等提醒",
-        },
-    },
-    "required": ["summary", "key_points", "entities", "labels", "confidence", "warnings"],
-}
+RESPONSE_SCHEMA = {}
 
 USER_PROMPTS: List[str] = [
     r"""

@@ -1,10 +1,10 @@
-# filename: vertex_batch_grounded.py
+# filename: vertex_batch_grounding.py
 import argparse
 import asyncio
 import json
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Union
 
 from google import genai
 from google.genai import types
@@ -13,107 +13,85 @@ RETRYABLE_STATUS = {429, 500, 503, 504}
 
 
 # =========================
-# 可选：系统指令（不要求 structured output）
+# 系统指令（非 structured output）
 # =========================
 SYSTEM_INSTRUCTION = r"""
-你将启用 Google 搜索接地工具来回答问题。
+你可以使用 Google 搜索接地（grounding）工具来回答问题（如果已启用）。
 要求：
-1) 尽量基于搜索结果回答，不要编造。
-2) 回答要清晰、简洁；如果信息不足请明确说明不确定点。
-3) 不要输出任何 JSON 或代码块（除非用户明确要求）。
-"""
-# =========================
+- 尽量给出可靠来源；如果是通过搜索得到的结论，请在回答中体现出处/引用依据（如可用）。
+- 不要编造不存在的来源；不确定就直说不确定。
+- 回答用中文，条理清晰。
+""".strip()
+
+
+def safe_get(obj: Any, *keys: str, default: Any = None) -> Any:
+    """
+    Try to get nested attrs/keys with multiple candidate key names.
+    Example: safe_get(resp, "candidates", default=[])
+    Example: safe_get(cand0, "grounding_metadata", "groundingMetadata", default=None)
+    """
+    cur = obj
+    for k in keys:
+        if cur is None:
+            return default
+        # object attribute
+        if hasattr(cur, k):
+            cur = getattr(cur, k)
+            continue
+        # dict key
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+            continue
+        return default
+    return cur
 
 
 def get_status_code(err: Exception) -> Optional[int]:
-    return getattr(err, "status_code", None)
-
-
-def backoff(attempt: int, base: float = 0.8, cap: float = 20.0) -> float:
-    delay = min(cap, base * (2 ** attempt))
-    return delay + random.uniform(0, 0.5)
-
-
-class RateLimiter:
-    """Global QPS limiter: at most qps requests/sec."""
-    def __init__(self, qps: float):
-        self.qps = qps
-        self._lock = asyncio.Lock()
-        self._next_time = 0.0
-
-    async def acquire(self):
-        if self.qps <= 0:
-            return
-        async with self._lock:
-            now = time.monotonic()
-            wait = self._next_time - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._next_time = max(self._next_time, now) + 1.0 / self.qps
-
-
-def safe_get(obj: Any, *names: str, default=None):
-    """Try multiple attribute names (snake/camel) on SDK objects."""
-    for n in names:
-        if hasattr(obj, n):
-            v = getattr(obj, n)
-            if v is not None:
-                return v
-    return default
-
-
-def build_config(
-    temperature: float,
-    max_output_tokens: int,
-    top_p: float,
-    enable_grounding: bool,
-    use_legacy_grounding_tool: bool,
-) -> types.GenerateContentConfig:
     """
-    Build ONE shared config reused across all prompts.
-
-    Grounding tool:
-      - Recommended (Gemini 2.0+ / 2.5 / 3): google_search
-      - Legacy (Gemini 1.5): google_search_retrieval with dynamic config
+    Best-effort extraction of HTTP-ish status code from different exception types.
     """
-    if not (0.0 <= top_p <= 1.0):
-        raise ValueError("top_p must be within [0, 1].")
-
-    kwargs: Dict[str, Any] = {
-        "temperature": temperature,
-        "max_output_tokens": max_output_tokens,
-        "top_p": top_p,
-    }
-
-    if SYSTEM_INSTRUCTION.strip():
-        kwargs["system_instruction"] = [SYSTEM_INSTRUCTION]
-
-    if enable_grounding:
-        if use_legacy_grounding_tool:
-            # Legacy for Gemini 1.5: google_search_retrieval
-            # (kept here for compatibility if you ever switch to 1.5 models)
-            retrieval_tool = types.Tool(
-                google_search_retrieval=types.GoogleSearchRetrieval(
-                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                        mode=types.DynamicRetrievalConfigMode.MODE_DYNAMIC,
-                        dynamic_threshold=0.7,
-                    )
-                )
-            )
-            kwargs["tools"] = [retrieval_tool]
-        else:
-            # Recommended for current models: google_search
-            grounding_tool = types.Tool(google_search=types.GoogleSearch())
-            kwargs["tools"] = [grounding_tool]
-
-    return types.GenerateContentConfig(**kwargs)
+    for attr in ("status_code", "code", "status"):
+        v = getattr(err, attr, None)
+        if isinstance(v, int):
+            return v
+    # sometimes nested: err.response.status_code
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        v = getattr(resp, "status_code", None)
+        if isinstance(v, int):
+            return v
+    return None
 
 
-def extract_grounding_metadata(resp: Any) -> Dict[str, Any]:
+def extract_text(resp: Any) -> str:
     """
-    Extract queries + sources from response.candidates[0].grounding_metadata (if present).
+    Extract text from response candidates content parts (best effort).
     """
-    candidates = safe_get(resp, "candidates", default=[])
+    candidates = safe_get(resp, "candidates", default=[]) or []
+    if not candidates:
+        return ""
+
+    cand0 = candidates[0]
+    content = safe_get(cand0, "content", default=None)
+    if content is None:
+        return ""
+
+    parts = safe_get(content, "parts", default=[]) or []
+    texts: List[str] = []
+    for p in parts:
+        t = safe_get(p, "text", default=None)
+        if isinstance(t, str) and t.strip():
+            texts.append(t)
+    return "\n".join(texts).strip()
+
+
+def extract_grounding(resp: Any) -> Dict[str, Any]:
+    """
+    Extract grounding metadata:
+      - web_search_queries
+      - sources (from grounding_chunks[*].web)
+    """
+    candidates = safe_get(resp, "candidates", default=[]) or []
     if not candidates:
         return {"has_grounding": False, "web_search_queries": [], "sources": []}
 
@@ -126,134 +104,218 @@ def extract_grounding_metadata(resp: Any) -> Dict[str, Any]:
     chunks = safe_get(gm, "grounding_chunks", "groundingChunks", default=[]) or []
 
     sources: List[Dict[str, Any]] = []
-    for i, ch in enumerate(chunks):
+    for ch in chunks:
         web = safe_get(ch, "web", default=None)
         if not web:
             continue
-        uri = safe_get(web, "uri", default=None)
+        uri = safe_get(web, "uri", "url", default=None)
         title = safe_get(web, "title", default=None)
-        if uri or title:
-            sources.append({"index": i + 1, "title": title, "uri": uri})
+        # Some responses include "publisher", "description" etc. Keep minimal & stable.
+        src = {}
+        if isinstance(title, str) and title.strip():
+            src["title"] = title.strip()
+        if isinstance(uri, str) and uri.strip():
+            src["url"] = uri.strip()
+        if src:
+            sources.append(src)
+
+    # de-dup by url
+    seen = set()
+    uniq_sources = []
+    for s in sources:
+        u = s.get("url")
+        if u and u in seen:
+            continue
+        if u:
+            seen.add(u)
+        uniq_sources.append(s)
+
+    # normalize queries to strings
+    norm_q: List[str] = []
+    for q in queries:
+        if isinstance(q, str):
+            if q.strip():
+                norm_q.append(q.strip())
+        else:
+            # sometimes query is object with "text"
+            qt = safe_get(q, "text", default=None)
+            if isinstance(qt, str) and qt.strip():
+                norm_q.append(qt.strip())
 
     return {
         "has_grounding": True,
-        "web_search_queries": list(queries),
-        "sources": sources,
+        "web_search_queries": norm_q,
+        "sources": uniq_sources,
     }
 
 
-def add_inline_citations(resp: Any) -> Optional[str]:
+class RateLimiter:
     """
-    Insert markdown citations into resp.text using groundingSupports + groundingChunks.
-    Mirrors the pattern shown in official docs.
+    Simple global QPS limiter across concurrent tasks.
+    Enforces minimum interval of 1/qps between requests.
     """
-    text = safe_get(resp, "text", default=None)
-    if not isinstance(text, str) or not text:
-        return None
 
-    candidates = safe_get(resp, "candidates", default=[])
-    if not candidates:
-        return None
+    def __init__(self, qps: float):
+        self.qps = float(qps)
+        self._lock = asyncio.Lock()
+        self._next_time = 0.0
 
-    gm = safe_get(candidates[0], "grounding_metadata", "groundingMetadata", default=None)
-    if not gm:
-        return None
-
-    supports = safe_get(gm, "grounding_supports", "groundingSupports", default=[]) or []
-    chunks = safe_get(gm, "grounding_chunks", "groundingChunks", default=[]) or []
-
-    if not supports or not chunks:
-        return None
-
-    # Sort supports by end index descending (avoid shifting indices when inserting)
-    def end_index_of_support(s) -> int:
-        seg = safe_get(s, "segment", default=None)
-        if not seg:
-            return -1
-        end_idx = safe_get(seg, "end_index", "endIndex", default=-1)
-        try:
-            return int(end_idx)
-        except Exception:
-            return -1
-
-    sorted_supports = sorted(supports, key=end_index_of_support, reverse=True)
-
-    out = text
-    for s in sorted_supports:
-        seg = safe_get(s, "segment", default=None)
-        if not seg:
-            continue
-        end_idx = safe_get(seg, "end_index", "endIndex", default=None)
-        if end_idx is None:
-            continue
-        try:
-            end_idx = int(end_idx)
-        except Exception:
-            continue
-
-        idxs = safe_get(s, "grounding_chunk_indices", "groundingChunkIndices", default=[]) or []
-        if not idxs:
-            continue
-
-        links: List[str] = []
-        for i in idxs:
-            try:
-                i = int(i)
-            except Exception:
-                continue
-            if 0 <= i < len(chunks):
-                web = safe_get(chunks[i], "web", default=None)
-                uri = safe_get(web, "uri", default=None) if web else None
-                if uri:
-                    # Use 1-based display index
-                    links.append(f"[{i + 1}]({uri})")
-        if not links:
-            continue
-
-        citation_str = ", ".join(links)
-        if 0 <= end_idx <= len(out):
-            out = out[:end_idx] + citation_str + out[end_idx:]
-
-    return out
+    async def wait(self) -> None:
+        if self.qps <= 0:
+            return
+        interval = 1.0 / self.qps
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._next_time:
+                await asyncio.sleep(self._next_time - now)
+                now = time.monotonic()
+            self._next_time = now + interval
 
 
-async def call_with_retry(
-    aclient: Any,
+def load_prompts_from_file(path: str) -> List[str]:
+    """
+    Supports:
+      - .txt: one prompt per line (empty lines ignored)
+      - .json: {"prompts": ["...", "..."]} or ["...", "..."]
+      - .jsonl: each line {"prompt": "..."} or {"text": "..."} or raw string
+    """
+    path_l = path.lower()
+    if path_l.endswith(".txt"):
+        out: List[str] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    out.append(s)
+        return out
+
+    if path_l.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+        if isinstance(data, dict) and "prompts" in data and isinstance(data["prompts"], list):
+            return [str(x) for x in data["prompts"] if str(x).strip()]
+        raise ValueError('Unsupported JSON format. Use a list or {"prompts": [...]}')
+
+    if path_l.endswith(".jsonl"):
+        out: List[str] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                # try JSON first
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, str):
+                        if obj.strip():
+                            out.append(obj.strip())
+                        continue
+                    if isinstance(obj, dict):
+                        p = obj.get("prompt") or obj.get("text") or obj.get("q") or obj.get("question")
+                        if isinstance(p, str) and p.strip():
+                            out.append(p.strip())
+                        continue
+                except Exception:
+                    pass
+                # fallback: raw line
+                out.append(s)
+        return out
+
+    raise ValueError("Unsupported file type. Use .txt/.json/.jsonl")
+
+
+async def generate_one(
+    client: Any,
     model: str,
-    contents: str,
-    config: types.GenerateContentConfig,
-    limiter: RateLimiter,
+    prompt: str,
+    *,
+    enable_grounding: bool,
+    temperature: float,
+    top_p: float,
+    max_output_tokens: int,
     max_retries: int,
+    rate_limiter: RateLimiter,
 ) -> Dict[str, Any]:
+    """
+    One request with retry.
+    """
+    cfg_kwargs: Dict[str, Any] = dict(
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=max_output_tokens,
+        system_instruction=SYSTEM_INSTRUCTION,
+    )
+
+    if enable_grounding:
+        cfg_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+    config = types.GenerateContentConfig(**cfg_kwargs)
+
     last_err: Optional[str] = None
+    t0 = time.monotonic()
+
     for attempt in range(max_retries + 1):
         try:
-            await limiter.acquire()
-            resp = await aclient.models.generate_content(
+            await rate_limiter.wait()
+            resp = await client.models.generate_content(
                 model=model,
-                contents=contents,
+                contents=prompt,
                 config=config,
             )
-            grounded_text = add_inline_citations(resp)
-            grounding = extract_grounding_metadata(resp)
+
+            text = extract_text(resp)
+            grounding = extract_grounding(resp) if enable_grounding else {
+                "has_grounding": False,
+                "web_search_queries": [],
+                "sources": [],
+            }
 
             return {
                 "ok": True,
-                "text": resp.text,
-                "text_with_citations": grounded_text,
-                **grounding,
+                "prompt": prompt,
+                "model": model,
+                "enable_grounding": enable_grounding,
+                "latency_s": round(time.monotonic() - t0, 4),
+                "text": text,
+                "grounding": grounding,
             }
-        except Exception as e:
-            code = get_status_code(e)
-            last_err = f"{type(e).__name__}: {e}"
-            if code in RETRYABLE_STATUS and attempt < max_retries:
-                await asyncio.sleep(backoff(attempt))
-                continue
-            return {"ok": False, "error": last_err, "status_code": code}
-    return {"ok": False, "error": last_err or "Unknown error"}
+
+        except Exception as err:
+            sc = get_status_code(err)
+            last_err = f"{type(err).__name__}: {err}"
+            retryable = (sc in RETRYABLE_STATUS) if sc is not None else False
+
+            if attempt >= max_retries or not retryable:
+                return {
+                    "ok": False,
+                    "prompt": prompt,
+                    "model": model,
+                    "enable_grounding": enable_grounding,
+                    "latency_s": round(time.monotonic() - t0, 4),
+                    "error": last_err,
+                    "status_code": sc,
+                }
+
+            # exponential backoff with jitter
+            base = 0.8 * (2 ** attempt)
+            sleep_s = base + random.uniform(0.0, 0.3)
+            await asyncio.sleep(sleep_s)
+
+    # should not reach
+    return {
+        "ok": False,
+        "prompt": prompt,
+        "model": model,
+        "enable_grounding": enable_grounding,
+        "latency_s": round(time.monotonic() - t0, 4),
+        "error": last_err or "Unknown error",
+    }
 
 
 async def run_batch(
+    *,
     api_key: str,
     model: str,
     prompts: List[str],
@@ -262,125 +324,93 @@ async def run_batch(
     qps: float,
     max_retries: int,
     temperature: float,
-    max_output_tokens: int,
     top_p: float,
+    max_output_tokens: int,
     enable_grounding: bool,
-    use_legacy_grounding_tool: bool,
-):
-    if not (1 <= len(prompts) <= 100):
-        raise ValueError(f"USER_PROMPTS must contain 1~100 items, got {len(prompts)}")
+) -> None:
+    client = genai.Client(vertexai=True, api_key=api_key).aio
 
-    config = build_config(
-        temperature=temperature,
-        max_output_tokens=max_output_tokens,
-        top_p=top_p,
-        enable_grounding=enable_grounding,
-        use_legacy_grounding_tool=use_legacy_grounding_tool,
-    )
-    limiter = RateLimiter(qps=qps)
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    rate_limiter = RateLimiter(qps)
+    write_lock = asyncio.Lock()
 
-    async with genai.Client(vertexai=True, api_key=api_key).aio as aclient:
-        async def one(i: int, p: str) -> Dict[str, Any]:
-            async with sem:
-                r = await call_with_retry(
-                    aclient=aclient,
-                    model=model,
-                    contents=p,
-                    config=config,
-                    limiter=limiter,
-                    max_retries=max_retries,
-                )
-                return {"index": i, "input": p, **r}
+    # ensure output dir exists if nested path
+    # (keep simple; if outfile is just filename, this does nothing)
+    import os
+    outdir = os.path.dirname(outfile)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
 
-        tasks = [asyncio.create_task(one(i, p)) for i, p in enumerate(prompts)]
-        with open(outfile, "w", encoding="utf-8") as f:
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                f.flush()
+    async def worker(i: int, p: str) -> None:
+        async with sem:
+            result = await generate_one(
+                client=client,
+                model=model,
+                prompt=p,
+                enable_grounding=enable_grounding,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+                max_retries=max_retries,
+                rate_limiter=rate_limiter,
+            )
+            result["index"] = i
+            # write jsonl line
+            line = json.dumps(result, ensure_ascii=False)
+            async with write_lock:
+                with open(outfile, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
 
+    # fresh write
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("")
 
-def load_prompts_from_file(path: str) -> List[str]:
-    """
-    Load prompts from a text file.
-    Supports:
-      - .txt: one prompt per line (empty lines ignored)
-      - .json: {"prompts": ["...", "..."]} or ["...", "..."]
-      - .jsonl: each line {"prompt": "..."} or {"text": "..."} or raw string
-    """
-    if path.lower().endswith(".txt"):
-        out = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    out.append(s)
-        return out
-
-    if path.lower().endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if isinstance(obj, list):
-            return [str(x) for x in obj if str(x).strip()]
-        if isinstance(obj, dict) and "prompts" in obj and isinstance(obj["prompts"], list):
-            return [str(x) for x in obj["prompts"] if str(x).strip()]
-        raise ValueError("Unsupported JSON format. Use a list or {\"prompts\": [...]}")
-
-    if path.lower().endswith(".jsonl"):
-        out = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        p = obj.get("prompt") or obj.get("text")
-                        if p and str(p).strip():
-                            out.append(str(p))
-                    elif isinstance(obj, str) and obj.strip():
-                        out.append(obj)
-                except Exception:
-                    # fallback: treat as raw prompt line
-                    out.append(line)
-        return out
-
-    raise ValueError("Unsupported file type. Use .txt/.json/.jsonl")
+    tasks = [asyncio.create_task(worker(i, p)) for i, p in enumerate(prompts)]
+    await asyncio.gather(*tasks)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--api_key", required=True, help="Express mode API key")
+    ap.add_argument("--api_key", required=True, help="Vertex Express mode API key")
     ap.add_argument("--model", default="gemini-3-flash-preview")
-    ap.add_argument("--outfile", default="results_grounded.jsonl")
+    ap.add_argument("--outfile", default="results_grounding.jsonl")
 
     ap.add_argument("--concurrency", type=int, default=10)
-    ap.add_argument("--qps", type=float, default=5.0)  # 0=unlimited
+    ap.add_argument("--qps", type=float, default=5.0, help="0 = unlimited")
     ap.add_argument("--max_retries", type=int, default=5)
 
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--max_output_tokens", type=int, default=8192)
-
-    ap.add_argument("--enable_grounding", action="store_true", help="Enable Google Search grounding tool")
-    ap.add_argument(
-        "--legacy_grounding_tool",
-        action="store_true",
-        help="Use legacy google_search_retrieval tool (for Gemini 1.5 models)",
-    )
+    ap.add_argument("--disable_grounding", action="store_true", help="Disable Google Search grounding tool")
 
     ap.add_argument("--prompts_file", default="", help="Load prompts from .txt/.json/.jsonl (optional)")
+    ap.add_argument(
+        "--prompt",
+        action="append",
+        default=[],
+        help="Single prompt (can be repeated). If provided, overrides default prompts unless --prompts_file is also set.",
+    )
+
     args = ap.parse_args()
 
-    # Default prompts (if you don't pass --prompts_file)
+    enable_grounding = not args.disable_grounding
+
+    # Default prompts (when no --prompts_file and no --prompt)
     prompts: List[str] = [
-        "最近一周OpenAI有什么重要发布？请给出来源。",
-        "Euro 2024 的冠军是谁？给出来源。",
+        "用一句话解释什么是 RAG，并给出一个可靠来源。",
+        "最近一个月 NVIDIA 有哪些重要发布？请给出来源。",
     ]
+
+    # CLI --prompt has priority (but allow combining with prompts_file)
+    if args.prompt:
+        prompts = [p.strip() for p in args.prompt if p and p.strip()]
+
     if args.prompts_file.strip():
         prompts = load_prompts_from_file(args.prompts_file.strip())
+
+    if not prompts:
+        raise ValueError("No prompts provided. Use --prompt or --prompts_file.")
 
     asyncio.run(
         run_batch(
@@ -392,10 +422,9 @@ def main():
             qps=args.qps,
             max_retries=args.max_retries,
             temperature=args.temperature,
-            max_output_tokens=args.max_output_tokens,
             top_p=args.top_p,
-            enable_grounding=args.enable_grounding,
-            use_legacy_grounding_tool=args.legacy_grounding_tool,
+            max_output_tokens=args.max_output_tokens,
+            enable_grounding=enable_grounding,
         )
     )
     print(f"Done. Wrote: {args.outfile}")
