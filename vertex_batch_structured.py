@@ -159,7 +159,6 @@ async def run_batch(
                     **r,
                 }
 
-                # If structured output enabled, try parsing JSON (best-effort)
                 if r.get("ok") and isinstance(r.get("text"), str) and RESPONSE_SCHEMA:
                     out["raw_text"] = r["text"]
                     try:
