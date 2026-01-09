@@ -401,8 +401,6 @@ def main():
         "用一句话解释什么是 RAG，并给出一个可靠来源。",
         "最近一个月 NVIDIA 有哪些重要发布？请给出来源。",
     ]
-
-    # CLI --prompt has priority (but allow combining with prompts_file)
     if args.prompt:
         prompts = [p.strip() for p in args.prompt if p and p.strip()]
 
